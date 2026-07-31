@@ -1,0 +1,89 @@
+bundle:
+  name: fraud-detection-lakehouse
+
+variables:
+  catalog:
+    description: Unity Catalog catalog to write tables into
+    default: workspace
+  schema:
+    description: Unity Catalog schema to write tables into
+    default: fraud_detection
+
+resources:
+  pipelines:
+    fraud_pipeline:
+      name: fraud_detection_pipeline_${bundle.target}
+      catalog: ${var.catalog}
+      target: ${var.schema}
+      serverless: true
+      photon: true
+      configuration:
+        raw_root: /Volumes/${var.catalog}/${var.schema}/raw_landing
+      libraries:
+        - notebook:
+            path: transforms/bronze.py
+        - notebook:
+            path: transforms/silver.py
+        - notebook:
+            path: transforms/gold.py
+
+  jobs:
+    fraud_detection_job:
+      name: fraud_detection_job_${bundle.target}
+      description: >-
+        Generates sample data, runs the Lakeflow bronze/silver/gold pipeline,
+        trains + registers the fraud model, scores new transactions, and applies
+        Unity Catalog governance (masks/row filters/tags).
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+      tasks:
+        - task_key: generate_sample_data
+          notebook_task:
+            notebook_path: transforms/00_generate_sample_data.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+
+        - task_key: run_pipeline
+          depends_on:
+            - task_key: generate_sample_data
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.fraud_pipeline.id}
+
+        - task_key: train_model
+          depends_on:
+            - task_key: run_pipeline
+          notebook_task:
+            notebook_path: ml/01_train_model.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+
+        - task_key: batch_inference
+          depends_on:
+            - task_key: train_model
+          notebook_task:
+            notebook_path: ml/02_batch_inference.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+              fraud_threshold: "0.5"
+
+        - task_key: apply_governance
+          depends_on:
+            - task_key: batch_inference
+          notebook_task:
+            notebook_path: governance/03_apply_governance.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-fbe3df8d-7ffc.cloud.databricks.com
