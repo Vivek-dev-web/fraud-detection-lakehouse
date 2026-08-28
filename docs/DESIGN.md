@@ -164,6 +164,10 @@ Two SQL functions gate on `is_account_group_member('admins')`: `mask_pii` redact
 
 Classification tags (`data_classification=pii` at table level, `pii=true` on individual columns) are applied the same way, on the same subset of tables.
 
+**Access boundary — gold-layer grants.** Bronze/silver need no explicit action: Unity Catalog is secure-by-default, so without a grant they stay inaccessible to anyone but the owner. The five gold tables (including `gold_dq_results`) are explicitly granted `SELECT` to `account users`.
+
+> **Build note:** `account users`, not a custom group. A dedicated customer-facing account group is the more realistic real-world choice, but Free Edition has no account-console access, so no custom account-level group can be created here — verified: `GRANT SELECT ... TO gold_consumers` against a freshly created *workspace-local* group fails with `PRINCIPAL_DOES_NOT_EXIST`, since UC grants require account-level identities, and `account users` is the one available without account-console access. Confirmed via `SHOW GRANTS ON TABLE ...`: gold tables carry the `account users` grant, silver/bronze tables don't. On a paid tier, swap `account users` for a real customer-facing account group.
+
 ### 4.9 Dashboard & alert — `dashboard/deploy_dashboard.py`
 
 A standalone script (Databricks SDK, run locally — not part of the bundle) publishes a two-page Lakeview dashboard *Fraud Detection Overview*:
@@ -215,6 +219,7 @@ Boards tracks the project's open bugs and backlog as work items (mirroring `docs
 
 - **Materialized views don't take masks or row filters.** Verified, not assumed: `silver_accounts` and `gold_account_risk_scores` silently reject `ALTER TABLE ... SET MASK` / `SET ROW FILTER`. PII in `silver_accounts` is therefore *not* actually masked today. Fix options: convert those tables to streaming tables, or apply the mask to a plain managed table built on top instead.
 - **Single-admin workspace.** Both governance functions gate on `is_account_group_member('admins')`. With one admin user, the mechanism is wired correctly but never visibly restricts anything.
+- **No custom account-level group.** The gold-layer access grants (§4.8) target `account users` rather than a dedicated customer-facing group, since Free Edition has no account-console access to create one. `account users` currently means "the single admin," so like the point above, the grant is real and verifiable but doesn't visibly restrict anyone yet.
 - **Random train/test split.** `txn_count_last_10min` and `amount_zscore` are order-dependent features; a random stratified split can leak information a time-based split would not.
 - **Model promotion is unconditional.** `train_model` always repoints `champion` at the newest version, regardless of whether it's actually better.
 - **Dashboard/alert live outside the bundle.** Lakeview dashboards and SQL alerts aren't first-class resources in this CLI's bundle schema — `deploy_dashboard.py` is a manual step.

@@ -2,13 +2,23 @@
 # MAGIC %md
 # MAGIC ### Unity Catalog governance
 # MAGIC Applies column masks (PII redaction), row filters (high-risk account restriction),
-# MAGIC and classification tags on top of the tables the Lakeflow pipeline produces. All
-# MAGIC checks key off `is_account_group_member('admins')` -- on a single-admin workspace
-# MAGIC that means the mechanism is correctly wired even though the current user won't
-# MAGIC visibly see anything masked; add a non-admin user/group to see it take effect.
+# MAGIC classification tags, and gold-layer access grants on top of the tables the Lakeflow
+# MAGIC pipeline produces. Masks/row filters key off `is_account_group_member('admins')` --
+# MAGIC on a single-admin workspace that means the mechanism is correctly wired even though
+# MAGIC the current user won't visibly see anything masked; add a non-admin user/group to see
+# MAGIC it take effect.
 # MAGIC
 # MAGIC Note: a Lakeflow **full refresh** of a table can reset masks/row filters applied
 # MAGIC outside the pipeline definition -- rerun this notebook after a full refresh.
+# MAGIC
+# MAGIC **Access boundary — bronze/silver internal, gold customer-facing.** Bronze/silver need
+# MAGIC no explicit action: Unity Catalog is secure-by-default, so without a grant they're
+# MAGIC already inaccessible to anyone but the owner. Gold is explicitly granted SELECT to
+# MAGIC `account users`, not a custom group -- Free Edition has no account-console access, so a
+# MAGIC real custom account-level group can't be created here (verified: a workspace-local
+# MAGIC group is silently rejected by `GRANT` with `PRINCIPAL_DOES_NOT_EXIST`, since UC grants
+# MAGIC require account-level identities). On a paid tier with account-console access, swap
+# MAGIC `account users` below for a real customer-facing account group.
 
 # COMMAND ----------
 dbutils.widgets.text("catalog", "workspace")
@@ -88,5 +98,18 @@ for table, col in [
     ("silver_transactions", "phone"),
 ]:
     run_sql(f"ALTER TABLE {FQ}.{table} ALTER COLUMN {col} SET TAGS ('pii' = 'true')", f"tag {table}.{col}")
+
+# COMMAND ----------
+# MAGIC %md #### Gold-layer access grants -- bronze/silver stay internal by default (no grant)
+
+# COMMAND ----------
+for table in [
+    "gold_fraud_features",
+    "gold_daily_fraud_summary",
+    "gold_account_risk_scores",
+    "gold_fraud_predictions",
+    "gold_dq_results",
+]:
+    run_sql(f"GRANT SELECT ON TABLE {FQ}.{table} TO `account users`", f"grant SELECT on {table} to account users")
 
 print("Governance setup complete.")

@@ -50,7 +50,9 @@ merchant files   │  Auto Loader   ->    expectations,       ->   feature engin
   `gold_dq_results` and shown on the dashboard's Data Quality page.
 - **Unity Catalog governance** (`governance/`): column masking functions for PII
   (`customer_name`, `email`, `phone`), a row filter restricting `HIGH` risk-segment rows,
-  and classification tags -- all gated on `is_account_group_member('admins')`.
+  classification tags -- all gated on `is_account_group_member('admins')` -- and an access
+  boundary granting `SELECT` on the five gold tables to `account users` while bronze/silver
+  stay ungranted (Unity Catalog is secure-by-default, so no explicit revoke is needed).
 - **Lakeview dashboard + SQL alert** (`dashboard/deploy_dashboard.py`): a Fraud Overview page
   (flagged-transaction counter, fraud-by-category bar chart, fraud-rate trend line) and a Data
   Quality page (open-issues counter, per-check results table), plus an alert that fires when
@@ -150,6 +152,11 @@ DeployProd on every merge stays well inside the free tier for realistic usage.
 - **Single-admin workspaces won't visibly see masking/row-filter effects** -- the governance
   functions check `is_account_group_member('admins')`, so the workspace owner always sees
   unmasked data. Add a non-admin user/group to see the restriction apply.
+- **Gold-layer access grants target `account users`, not a custom group** -- Free Edition has
+  no account-console access to create one. Verified: granting to a freshly created
+  workspace-local group fails with `PRINCIPAL_DOES_NOT_EXIST`, since UC grants require
+  account-level identities. Swap `account users` for a real customer-facing account group on
+  a paid tier.
 - **Column masks/row filters only take on `STREAMING_TABLE`s and plain managed tables, not
   `MATERIALIZED_VIEW`s** -- verified on a real deployment: `silver_transactions` (streaming
   table) and `gold_fraud_predictions` (plain managed table) both took the mask/row filter
