@@ -149,14 +149,25 @@ DeployProd on every merge stays well inside the free tier for realistic usage.
 
 ## Notes / caveats
 
-- **Single-admin workspaces won't visibly see masking/row-filter effects** -- the governance
-  functions check `is_account_group_member('admins')`, so the workspace owner always sees
-  unmasked data. Add a non-admin user/group to see the restriction apply.
+- **The workspace owner is not exempt from masks/row filters -- verified, this was wrong
+  before.** `is_account_group_member('admins')` checks *account-level* group membership, not
+  workspace-admin status. The owner isn't in that account-level group, so they see the exact
+  same `***MASKED***`/filtered view anyone else would -- confirmed live by comparing their
+  query results to a real non-admin service principal's. Free Edition has no account-console
+  access to fix this by adding them to a real `admins` account group.
 - **Gold-layer access grants target `account users`, not a custom group** -- Free Edition has
-  no account-console access to create one. Verified: granting to a freshly created
-  workspace-local group fails with `PRINCIPAL_DOES_NOT_EXIST`, since UC grants require
-  account-level identities. Swap `account users` for a real customer-facing account group on
-  a paid tier.
+  no account-console access to create one. Verified two ways: granting to a freshly created
+  workspace-local group fails with `PRINCIPAL_DOES_NOT_EXIST` (UC grants need account-level
+  identities), and a real non-admin service principal could query every gold table and none
+  of bronze/silver once granted `account users` access plus `USE CATALOG`/`USE SCHEMA` on the
+  parents (`SELECT` alone isn't reachable without those two). Swap `account users` for a real
+  customer-facing account group on a paid tier.
+- **How to verify any of this yourself**: create a service principal
+  (`databricks service-principals create`), generate an OAuth secret for it
+  (`databricks service-principal-secrets-proxy create <sp-id>`), exchange it for a token
+  (`POST /oidc/v1/token` with `grant_type=client_credentials`), and run queries against
+  `/api/2.0/sql/statements` with that token in the `Authorization` header. No email, no
+  invite, no second human required -- see `docs/DESIGN.md` §4.8.1 for exact results.
 - **Column masks/row filters only take on `STREAMING_TABLE`s and plain managed tables, not
   `MATERIALIZED_VIEW`s** -- verified on a real deployment: `silver_transactions` (streaming
   table) and `gold_fraud_predictions` (plain managed table) both took the mask/row filter

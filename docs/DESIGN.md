@@ -10,7 +10,7 @@ This document specifies what the fraud detection lakehouse does, how each compon
 
 **In scope:** a synthetic credit-card transaction feed; a declarative bronze/silver/gold pipeline; a trained, registered, and served fraud classifier; Unity Catalog governance controls; a BI dashboard and alert; CI/CD.
 
-**Out of scope:** this is a reference implementation, not a production fraud system. Data is synthetic, ground-truth labels come from a rule-based heuristic rather than investigated cases, and the workspace has a single admin user, which limits how governance effects can be observed (§6).
+**Out of scope:** this is a reference implementation, not a production fraud system. Data is synthetic, ground-truth labels come from a rule-based heuristic rather than investigated cases, and the workspace has a single admin user — governance is verified against a real non-admin service principal instead (§4.8.1), but there's no real second human to demonstrate it to day-to-day, and some limitations only affect that one user (§6).
 
 ## 2. Architecture
 
@@ -160,11 +160,29 @@ Checks split into two tiers:
 
 Two SQL functions gate on `is_account_group_member('admins')`: `mask_pii` redacts a string column to `***MASKED***`, `row_filter_high_risk` hides rows where `risk_segment = 'HIGH'`. Every `ALTER TABLE` statement is wrapped in try/except and logged as `[OK]` or `[SKIPPED]` — the notebook never fails the job even if a statement is unsupported on a given table.
 
-> **Verified result:** masks and the row filter took effect on `silver_transactions` (streaming table) and `gold_fraud_predictions` (plain managed table). They silently did *not* take effect on `silver_accounts` or `gold_account_risk_scores` — both materialized views. Confirmed directly via `databricks tables get`, not inferred. See §6.
+> **Verified result:** masks and the row filter took effect on `silver_transactions` (streaming table) and `gold_fraud_predictions` (plain managed table). They silently did *not* take effect on `silver_accounts` or `gold_account_risk_scores` — both materialized views. Confirmed two ways: directly via `databricks tables get` (metadata), and by actually querying as a real non-admin identity (§4.8.1) — for the tables where it's supposed to work, it does.
 
 Classification tags (`data_classification=pii` at table level, `pii=true` on individual columns) are applied the same way, on the same subset of tables.
 
-**Access boundary — gold-layer grants.** Bronze/silver need no explicit action: Unity Catalog is secure-by-default, so without a grant they stay inaccessible to anyone but the owner. The five gold tables (including `gold_dq_results`) are explicitly granted `SELECT` to `account users`.
+**Access boundary — gold-layer grants.** Bronze/silver need no explicit action: Unity Catalog is secure-by-default, so without a grant they stay inaccessible to anyone but the owner. The five gold tables (including `gold_dq_results`) are explicitly granted `SELECT` to `account users`, plus `USE CATALOG`/`USE SCHEMA` on their parents.
+
+> **Build note:** `SELECT` alone isn't reachable without `USE CATALOG` on the catalog and `USE SCHEMA` on the schema — a real non-admin service principal's query failed with `INSUFFICIENT_PERMISSIONS: does not have USE SCHEMA`, gold grant notwithstanding, until these two were added explicitly. Not relying on any workspace-level default grant, since that isn't guaranteed to exist on every tier.
+
+#### 4.8.1 Verifying governance against a real non-admin identity
+
+Free Edition's single-admin workspace made every governance claim above previously unverifiable except by reading `ALTER TABLE`/`GRANT` metadata — nobody existed to actually query the tables as anything other than the owner. A workspace-local **service principal** (no account-console access needed to create one, no email/invite flow, no human required) closes that gap: create it, generate an OAuth client-credentials token for it, and run real queries as that identity via the SQL Statement Execution API.
+
+Verified this way, end to end:
+
+| Check | Result |
+|---|---|
+| Query `bronze_transactions` with no grant | `INSUFFICIENT_PERMISSIONS` — default-deny confirmed |
+| Query `gold_fraud_predictions` (granted via `account users`) | Succeeds, real row count returned |
+| `silver_transactions.account_name`/`email` (granted for this test only) | `***MASKED***` — mask confirmed working |
+| `silver_accounts.customer_name`/`email` (granted for this test only) | Real values returned — confirms the materialized-view gap above, now via query, not just metadata |
+| `silver_transactions` row count by `risk_segment`, vs. ground truth via `bronze_transactions` JOIN `silver_accounts` | Ground truth: 2,040 HIGH / 14,781 LOW / 4,179 MEDIUM. Non-admin view: 0 HIGH / 14,781 LOW / 4,179 MEDIUM — row filter confirmed hiding exactly the HIGH rows, nothing else |
+
+> **Bigger finding, found by accident while building this check:** `is_account_group_member('admins')` returns `false` for the workspace owner (`vivek.jpr@outlook.com`) — they are a *workspace* admin, which is not the same thing as being a member of the *account-level* `admins` group these functions check. §6's earlier claim that "the current user won't visibly see anything masked" was wrong: the owner has been seeing `***MASKED***` on `silver_transactions.account_name`/`email` and zero HIGH-risk rows the whole time, same as anyone else would. Free Edition's lack of account-console access means there's no way to add the owner to a real account-level `admins` group to fix this — it's a platform limitation, not a bug in the governance code itself. See §6.
 
 > **Build note:** `account users`, not a custom group. A dedicated customer-facing account group is the more realistic real-world choice, but Free Edition has no account-console access, so no custom account-level group can be created here — verified: `GRANT SELECT ... TO gold_consumers` against a freshly created *workspace-local* group fails with `PRINCIPAL_DOES_NOT_EXIST`, since UC grants require account-level identities, and `account users` is the one available without account-console access. Confirmed via `SHOW GRANTS ON TABLE ...`: gold tables carry the `account users` grant, silver/bronze tables don't. On a paid tier, swap `account users` for a real customer-facing account group.
 
@@ -218,8 +236,8 @@ Boards tracks the project's open bugs and backlog as work items (mirroring `docs
 ## 6. Known limitations
 
 - **Materialized views don't take masks or row filters.** Verified, not assumed: `silver_accounts` and `gold_account_risk_scores` silently reject `ALTER TABLE ... SET MASK` / `SET ROW FILTER`. PII in `silver_accounts` is therefore *not* actually masked today. Fix options: convert those tables to streaming tables, or apply the mask to a plain managed table built on top instead.
-- **Single-admin workspace.** Both governance functions gate on `is_account_group_member('admins')`. With one admin user, the mechanism is wired correctly but never visibly restricts anything.
-- **No custom account-level group.** The gold-layer access grants (§4.8) target `account users` rather than a dedicated customer-facing group, since Free Edition has no account-console access to create one. `account users` currently means "the single admin," so like the point above, the grant is real and verifiable but doesn't visibly restrict anyone yet.
+- **The workspace owner isn't exempt from masks/row filters, and previously nothing here caught that.** `is_account_group_member('admins')` checks *account-level* group membership, not workspace-admin status — they're different things, and the owner (`vivek.jpr@outlook.com`) isn't a member of the account-level `admins` group. Verified live (§4.8.1): the owner has been seeing `***MASKED***` on `silver_transactions.account_name`/`email` and zero HIGH-risk rows, the same restricted view anyone else would get. Free Edition has no account-console access to add them to a real account-level `admins` group, so this can't be fixed from within Free Edition — it's a platform limitation the design should account for, not a wiring bug.
+- **No custom account-level group for gold access, same root cause.** The gold-layer grants (§4.8) target `account users` rather than a dedicated customer-facing group, since creating a custom account-level group needs account-console access Free Edition doesn't have. Unlike the point above, this one is functionally proven correct, not just "wired": a real non-admin service principal (§4.8.1) could query every gold table and none of bronze/silver, exactly as intended — `account users` is a real, working substitute for the group that would exist on a paid tier.
 - **Random train/test split.** `txn_count_last_10min` and `amount_zscore` are order-dependent features; a random stratified split can leak information a time-based split would not.
 - **Model promotion is unconditional.** `train_model` always repoints `champion` at the newest version, regardless of whether it's actually better.
 - **Dashboard/alert live outside the bundle.** Lakeview dashboards and SQL alerts aren't first-class resources in this CLI's bundle schema — `deploy_dashboard.py` is a manual step.

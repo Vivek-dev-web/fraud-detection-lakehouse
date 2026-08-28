@@ -101,8 +101,17 @@ for table, col in [
 
 # COMMAND ----------
 # MAGIC %md #### Gold-layer access grants -- bronze/silver stay internal by default (no grant)
+# MAGIC
+# MAGIC `SELECT` on a table is not reachable without `USE CATALOG`/`USE SCHEMA` on its parents --
+# MAGIC verified live with a real non-admin service principal: without these two, every query
+# MAGIC failed with `INSUFFICIENT_PERMISSIONS: does not have USE SCHEMA`, regardless of the
+# MAGIC table-level SELECT grant below. Granted explicitly here rather than relying on any
+# MAGIC workspace-level default, since that default isn't guaranteed to exist on every tier.
 
 # COMMAND ----------
+run_sql(f"GRANT USE CATALOG ON CATALOG {catalog} TO `account users`", "grant USE CATALOG to account users")
+run_sql(f"GRANT USE SCHEMA ON SCHEMA {FQ} TO `account users`", "grant USE SCHEMA to account users")
+
 for table in [
     "gold_fraud_features",
     "gold_daily_fraud_summary",
