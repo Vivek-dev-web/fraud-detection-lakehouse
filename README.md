@@ -122,6 +122,15 @@ lives on GitHub, not in Azure Repos:
 2. Choose **Existing Azure Pipelines YAML file** and point it at `/azure-pipelines.yml`.
 3. Before the first run, add two pipeline variables (**Edit -> Variables**):
    `DATABRICKS_HOST` (plain) and `DATABRICKS_TOKEN` (check **Keep this value secret**).
+4. For the `Deploy` stage's approval gate: **Pipelines -> Environments -> New environment**,
+   name it `databricks-dev`, skip the resource picker. Then on that environment's page,
+   **... -> Approvals and checks -> Approvals**, and add yourself as approver. Without this
+   step the Deploy stage will fail waiting on an environment that doesn't exist yet.
+
+Free tier covers this comfortably: Boards and the first 5 users are free on the Basic plan,
+and Azure Pipelines gives 1,800 free minutes/month on Microsoft-hosted agents -- a full
+`bundle deploy` + `bundle run` takes roughly 10-15 minutes, so dozens of manually-approved
+deploys per month stay well inside the free tier.
 
 ## Notes / caveats
 

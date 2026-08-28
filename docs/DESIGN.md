@@ -194,7 +194,9 @@ flowchart LR
 
 Two jobs on every push/PR to `main`: **test** runs the pytest suite; **validate-bundle** runs `databricks bundle validate` against `DATABRICKS_HOST`/`DATABRICKS_TOKEN` credentials, gated to same-repo pushes/PRs.
 
-`azure-pipelines.yml` mirrors the same two-stage shape for the [Azure DevOps project](https://dev.azure.com/vivekjpr/VivekTiwari_Project1) — `DATABRICKS_HOST`/`DATABRICKS_TOKEN` are set as pipeline variables in the Azure DevOps UI (the token marked secret) rather than in YAML, since Azure Pipelines doesn't support declaring secret values there. The fork-PR secret restriction GitHub Actions expresses as an explicit `if:` condition is instead an org/project-level setting in Azure DevOps ("Make secrets available to builds of forks"), off by default.
+`azure-pipelines.yml` mirrors the same two stages for the [Azure DevOps project](https://dev.azure.com/vivekjpr/VivekTiwari_Project1), plus a third that GitHub Actions doesn't have — `DATABRICKS_HOST`/`DATABRICKS_TOKEN` are set as pipeline variables in the Azure DevOps UI (the token marked secret) rather than in YAML, since Azure Pipelines doesn't support declaring secret values there. The fork-PR secret restriction GitHub Actions expresses as an explicit `if:` condition is instead an org/project-level setting in Azure DevOps ("Make secrets available to builds of forks"), off by default.
+
+A third stage, **Deploy**, runs `bundle deploy` + `bundle run fraud_detection_job` against the dev target on every real merge to `main` (excluded from PR validation builds via `Build.Reason`). It's a `deployment` job bound to the `databricks-dev` Environment, which carries a manual-approval check configured in the Azure DevOps UI, not in YAML — deliberately, so no YAML change alone could ever skip the approval and trigger a live job run unattended. Boards tracks the project's open bugs and backlog as work items (mirroring `docs/DESIGN.md` §6/§7.3) rather than only living in this document.
 
 ## 5. Design decisions
 

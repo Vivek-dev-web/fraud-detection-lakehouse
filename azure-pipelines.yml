@@ -1,11 +1,19 @@
-# Azure Pipelines equivalent of .github/workflows/ci.yml -- same two-stage shape (unit tests,
-# then bundle validation), so this repo's CI story doesn't change depending on which platform
-# runs it. Requires two pipeline variables set in the Azure DevOps UI (Pipelines -> Edit ->
-# Variables), not in this file: DATABRICKS_HOST (plain) and DATABRICKS_TOKEN (marked secret) --
-# Azure Pipelines doesn't support declaring secret values in YAML. Unlike the GitHub Actions
-# workflow, there's no explicit fork-PR guard here: Azure DevOps withholds secret variables
-# from fork PR builds by default at the org/project settings level (Pipelines > Settings ->
-# "Make secrets available to builds of forks"), not per-pipeline YAML.
+# Azure Pipelines equivalent of .github/workflows/ci.yml (Test + ValidateBundle), plus a third
+# Deploy stage GitHub Actions doesn't have -- bundle deploy + bundle run fraud_detection_job
+# against the dev target, gated behind a manual approval so a merge to main never silently
+# triggers a live Databricks job run. Requires two pipeline variables set in the Azure DevOps
+# UI (Pipelines -> Edit -> Variables), not in this file: DATABRICKS_HOST (plain) and
+# DATABRICKS_TOKEN (marked secret) -- Azure Pipelines doesn't support declaring secret values
+# in YAML. Unlike the GitHub Actions workflow, there's no explicit fork-PR guard here: Azure
+# DevOps withholds secret variables from fork PR builds by default at the org/project settings
+# level (Pipelines > Settings -> "Make secrets available to builds of forks"), not per-pipeline
+# YAML.
+#
+# The Deploy stage's approval gate is NOT expressible in this file by design (so a YAML change
+# alone could never bypass it) -- it lives on the "databricks-dev" Environment resource, a
+# one-time manual setup: Pipelines -> Environments -> New environment -> name it
+# "databricks-dev" -> skip the resource picker -> then on that environment's page,
+# "..." -> Approvals and checks -> Approvals -> add yourself as approver.
 
 trigger:
   branches:
@@ -48,3 +56,38 @@ stages:
             env:
               DATABRICKS_HOST: $(DATABRICKS_HOST)
               DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+
+  - stage: Deploy
+    displayName: Deploy to Databricks (dev)
+    dependsOn: ValidateBundle
+    # Only real merges to main, never PR validation builds -- a PR build has already run
+    # Test + ValidateBundle above and stops there.
+    condition: >
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+    jobs:
+      - deployment: deploy_and_run
+        displayName: bundle deploy + bundle run
+        environment: databricks-dev
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+                  displayName: Install Databricks CLI
+                - script: databricks bundle deploy
+                  displayName: Deploy bundle
+                  env:
+                    DATABRICKS_HOST: $(DATABRICKS_HOST)
+                    DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+                - script: databricks bundle run fraud_detection_job
+                  displayName: Run fraud_detection_job (waits for completion)
+                  env:
+                    DATABRICKS_HOST: $(DATABRICKS_HOST)
+                    DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
