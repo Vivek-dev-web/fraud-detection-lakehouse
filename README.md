@@ -147,6 +147,16 @@ plan, and Azure Pipelines gives 1,800 free minutes/month on Microsoft-hosted age
 `bundle deploy` + `bundle run` takes roughly 10-15 minutes, so even running both Deploy and
 DeployProd on every merge stays well inside the free tier for realistic usage.
 
+## Repository mirrors
+
+GitHub is the source of truth for this project -- Azure Repos
+(`vivekjpr/VivekTiwari_Project1`) carries a one-way, on-demand mirror of `main`, kept purely
+so Azure Repos' branch/PR/tag features have real history to work against. It's synced via
+`az repos import create --git-source-url <this-repo> --repository VivekTiwari_Project1`
+(server-side import through the `azure-devops` CLI extension) rather than a local `git push`
+-- Git Credential Manager's interactive browser OAuth prompt can't complete in a non-interactive
+shell against this org. Branches/PRs created directly in Azure Repos don't flow back to GitHub.
+
 ## Notes / caveats
 
 - **The workspace owner is not exempt from masks/row filters -- verified, this was wrong
