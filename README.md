@@ -3,8 +3,9 @@
 An end-to-end fraud-detection project on Databricks covering a wider slice of the
 platform than a plain ETL pipeline: a **declarative Lakeflow (Delta Live Tables)
 pipeline**, **MLflow model training + Unity Catalog Model Registry**, **batch
-inference**, **Unity Catalog governance** (column masks, row filters, tags), a
-**Lakeview dashboard + SQL alert**, and **CI/CD** via GitHub Actions.
+inference**, **automated data quality checks** with a real pass/fail gate,
+**Unity Catalog governance** (column masks, row filters, tags), a **Lakeview
+dashboard + SQL alert**, and **CI/CD** via GitHub Actions.
 
 ## Architecture
 
@@ -23,7 +24,7 @@ merchant files   │  Auto Loader   ->    expectations,       ->   feature engin
                                                       └─────────────────────────────────┘
                                                                         │
                                                                         v
-                                        governance (masks/row filters/tags) -> dashboard + alert
+                                        data quality gate -> governance (masks/row filters/tags) -> dashboard + alert
 ```
 
 | Domain | Financial transactions -- credit-card fraud detection |
@@ -32,6 +33,7 @@ merchant files   │  Auto Loader   ->    expectations,       ->   feature engin
 | Silver | `silver_accounts`, `silver_merchants` (deduped), `silver_transactions` (Lakeflow **expectations**: valid ids, positive amount, valid currency; enriched with account/merchant dims) |
 | Gold | `gold_fraud_features` (feature engineering: velocity, z-score, foreign-txn flag), `gold_daily_fraud_summary`, `gold_account_risk_scores` (business aggregates) |
 | ML | `gold_fraud_predictions` (batch-scored via a Unity Catalog-registered MLflow model) |
+| DQ | `gold_dq_results` (row-count, integrity, domain, freshness, and drift checks -- one row per check per job run) |
 
 ## What this project demonstrates
 
@@ -41,17 +43,23 @@ merchant files   │  Auto Loader   ->    expectations,       ->   feature engin
 - **MLflow + Unity Catalog Model Registry** (`ml/`): a run tracked with params/metrics/model
   artifact, registered as `<catalog>.<schema>.fraud_classifier`, promoted via a `champion`
   alias; batch inference loads the model with `mlflow.pyfunc.spark_udf`.
+- **Automated data quality checks with a real gate** (`governance/04_data_quality_checks.py`):
+  row-count reconciliation, null/duplicate/orphan checks, domain/range checks, and freshness
+  are hard gates that fail the job on violation; live flagged-rate vs. historical baseline
+  drift is a WARN-only signal that can never fail the job. Every check's result is written to
+  `gold_dq_results` and shown on the dashboard's Data Quality page.
 - **Unity Catalog governance** (`governance/`): column masking functions for PII
   (`customer_name`, `email`, `phone`), a row filter restricting `HIGH` risk-segment rows,
   and classification tags -- all gated on `is_account_group_member('admins')`.
-- **Lakeview dashboard + SQL alert** (`dashboard/deploy_dashboard.py`): 3-widget dashboard
-  (flagged-transaction counter, fraud-by-category bar chart, fraud-rate trend line) plus an
-  alert that fires when the latest day's fraud rate exceeds 5%.
-- **CI/CD** (`.github/workflows/ci.yml`): pytest unit tests + `databricks bundle validate`
-  on every push/PR.
-- **Unit-testable business logic** (`src/features.py`, `tests/`): the feature-engineering
-  rules (z-score, velocity, risk score) exist as plain-Python functions with edge-case tests
-  (zero-stddev, empty history, score saturation), independent of Spark.
+- **Lakeview dashboard + SQL alert** (`dashboard/deploy_dashboard.py`): a Fraud Overview page
+  (flagged-transaction counter, fraud-by-category bar chart, fraud-rate trend line) and a Data
+  Quality page (open-issues counter, per-check results table), plus an alert that fires when
+  the latest day's fraud rate exceeds 5%.
+- **CI/CD** (`.github/workflows/ci.yml`, `azure-pipelines.yml`): pytest unit tests +
+  `databricks bundle validate` on every push/PR, on both GitHub Actions and Azure Pipelines.
+- **Unit-testable business logic** (`src/features.py`, `src/data_quality.py`, `tests/`): the
+  feature-engineering rules (z-score, velocity, risk score) and the data-quality pass/fail/warn
+  logic exist as plain-Python functions with edge-case tests, independent of Spark.
 
 ## Deploy
 
@@ -67,8 +75,11 @@ databricks bundle deploy --profile <name>
 databricks bundle run fraud_detection_job --profile <name>
 ```
 
-This runs 5 tasks in order: `generate_sample_data` -> `run_pipeline` (triggers the Lakeflow
-pipeline: bronze -> silver -> gold) -> `train_model` -> `batch_inference` -> `apply_governance`.
+This runs 6 tasks in order: `generate_sample_data` -> `run_pipeline` (triggers the Lakeflow
+pipeline: bronze -> silver -> gold) -> `train_model` -> `batch_inference` ->
+`data_quality_checks` -> `apply_governance`. If a hard-gate check fails, the job stops before
+`apply_governance` runs -- set the `enforce_quality_gate` task parameter to `false` to log
+without blocking.
 
 Then deploy the dashboard + alert (not a bundle resource -- Lakeview/Alerts APIs are handled
 via a standalone script using the Databricks SDK):
@@ -80,12 +91,37 @@ python dashboard/deploy_dashboard.py --profile <name> --catalog workspace --sche
 
 Find a warehouse id with `databricks warehouses list --profile <name>`.
 
+If the published dashboard ever shows "No data" / "Visualization has no fields selected" on
+every widget at once, that's not a data or permissions problem -- confirmed live: the
+underlying tables have rows, the exact widget queries return correct results when run
+directly, and the SQL warehouse is healthy with `num_active_sessions: 0` -- meaning Lakeview
+never even opens a session to run the query. It's a client-side health-check retry loop
+(`/api/2.0/popproxy/health/...` requests repeatedly self-cancelling with `net::ERR_ABORTED`)
+that prevents the query from ever firing, independent of the dashboard definition. Try an
+incognito window or a different browser first. `dashboard/demo_backup_queries.sql` has the
+exact query behind every widget, verified working, for running live in the SQL Editor as a
+fallback.
+
 ## Local development
 
 ```powershell
 pip install -r requirements.txt
 pytest tests/ -v
 ```
+
+## CI/CD setup
+
+`.github/workflows/ci.yml` runs automatically on GitHub -- no setup beyond the
+`DATABRICKS_HOST`/`DATABRICKS_TOKEN` repo secrets already being present.
+
+`azure-pipelines.yml` needs a one-time manual hookup before it runs anything, since the code
+lives on GitHub, not in Azure Repos:
+
+1. In the [Azure DevOps project](https://dev.azure.com/vivekjpr/VivekTiwari_Project1), go to
+   **Pipelines -> New pipeline -> GitHub**, authorize access, and select this repo.
+2. Choose **Existing Azure Pipelines YAML file** and point it at `/azure-pipelines.yml`.
+3. Before the first run, add two pipeline variables (**Edit -> Variables**):
+   `DATABRICKS_HOST` (plain) and `DATABRICKS_TOKEN` (check **Keep this value secret**).
 
 ## Notes / caveats
 

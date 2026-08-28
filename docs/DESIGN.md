@@ -49,6 +49,7 @@ flowchart TB
 | `gold_daily_fraud_summary` | gold | materialized view | 1 row / date × category × country |
 | `gold_account_risk_scores` | gold | materialized view | 1 row / account |
 | `gold_fraud_predictions` | gold | managed table | 1 row / scored transaction |
+| `gold_dq_results` | gold | managed table | 1 row / data quality check / job run |
 
 ### 3.1 Core schemas
 
@@ -138,7 +139,24 @@ Scores `gold_fraud_features WHERE is_fraud IS NULL` (the live feed) against the 
 > - `spark.sparkContext.broadcast()` isn't reachable on serverless compute at all — the model is small enough that a closed-over variable (cloudpickled with the UDF) works fine without it.
 > - scikit-learn's `_validate_data` checks feature *names*, not just position — `pd.concat` on bare positional Series produces generic `_0.._N` names, so columns must be explicitly relabeled to match the training feature names before calling `predict_proba`.
 
-### 4.7 Governance — `governance/03_apply_governance.py`
+### 4.7 Automated data quality checks — `governance/04_data_quality_checks.py`
+
+Runs the checks from §8 as a real job task instead of a manual runbook. Each check produces a `CheckResult` (`src/data_quality.py`, pure-Python and unit tested — same split as `src/features.py`) and every result is appended to `gold_dq_results`, keyed by a `run_id` so history accumulates across runs instead of being overwritten.
+
+Checks split into two tiers:
+
+| Tier | Checks | Behavior |
+|---|---|---|
+| Hard gate | row-count reconciliation, key nulls, surviving duplicates, orphaned foreign keys, domain/range violations (§8.1–§8.4), freshness (§8.6) | Any FAIL raises `AssertionError` and stops the job, gated by the `enforce_quality_gate` job parameter (default `true`) |
+| Soft signal | live flagged-fraud rate vs. historical labeled baseline (§8.7) | WARN only, by construction — `drift_check` cannot produce FAIL. Drift is a signal to investigate, not proof the pipeline broke; it must never block the job. |
+
+`max_freshness_minutes` and `max_drift_deviation` are job parameters (defaults `1440` and `0.75`) rather than hardcoded, since what counts as "stale" or "too much drift" is a judgment call that will differ by deployment.
+
+> **Build notes — two issues found on the first live run of this task:**
+> - `from src.data_quality import ...` raised `ModuleNotFoundError: No module named 'src'` when run as a bundle-deployed job task — unlike a Databricks Repo, a bundle's synced workspace files don't reliably put the bundle root on `sys.path`. Fixed the same way `transforms/gold.py` relates to `src/features.py`: the notebook reimplements the small pass/fail/warn logic locally instead of importing it; `src/data_quality.py` stays the unit-tested spec.
+> - Freshness is measured against `gold_fraud_predictions.scored_at`, not `bronze_transactions._ingest_ts` as first attempted. `00_generate_sample_data.py` uses a fixed seed and writes to the same filenames every run (§4.1), so Auto Loader never reprocesses already-seen files and `_ingest_ts` freezes at whenever the demo data was first ingested — on a repo cloned weeks ago, that check FAILed on a run that had just succeeded. `scored_at` reflects `batch_inference`'s own execution time on every run instead, since it always overwrites.
+
+### 4.8 Governance — `governance/03_apply_governance.py`
 
 Two SQL functions gate on `is_account_group_member('admins')`: `mask_pii` redacts a string column to `***MASKED***`, `row_filter_high_risk` hides rows where `risk_segment = 'HIGH'`. Every `ALTER TABLE` statement is wrapped in try/except and logged as `[OK]` or `[SKIPPED]` — the notebook never fails the job even if a statement is unsupported on a given table.
 
@@ -146,27 +164,37 @@ Two SQL functions gate on `is_account_group_member('admins')`: `mask_pii` redact
 
 Classification tags (`data_classification=pii` at table level, `pii=true` on individual columns) are applied the same way, on the same subset of tables.
 
-### 4.8 Dashboard & alert — `dashboard/deploy_dashboard.py`
+### 4.9 Dashboard & alert — `dashboard/deploy_dashboard.py`
 
-A standalone script (Databricks SDK, run locally — not part of the bundle) publishes a Lakeview dashboard *Fraud Detection Overview* with three widgets — a flagged-transaction counter, a fraud-by-category bar chart, and a fraud-rate trend line — plus a SQL alert *High daily fraud rate* that fires when the latest day's fraud rate exceeds 5%. Idempotent by display-name lookup.
+A standalone script (Databricks SDK, run locally — not part of the bundle) publishes a two-page Lakeview dashboard *Fraud Detection Overview*:
 
-### 4.9 Orchestration — `databricks.yml`
+- **Fraud Overview page** — a flagged-transaction counter, a fraud-by-category bar chart, and a fraud-rate trend line.
+- **Data Quality page** — an open-issues counter (`COUNT_IF(status <> 'PASS')`) and a table of every check from the latest `gold_dq_results` run (name, category, status, value, message), so a customer can see the same PASS/WARN/FAIL detail that gates the job, without needing SQL access.
 
-One job, `fraud_detection_job_dev`, five sequential tasks:
+Plus a SQL alert *High daily fraud rate* that fires when the latest day's fraud rate exceeds 5%. Idempotent by display-name lookup.
+
+> **Build note:** published with `embed_credentials: True`, not `False`. With `False`, every viewer's own live browser session has to execute each widget's query against the warehouse — a session opened via an auto-login link couldn't, and the published page showed "No data" / "Visualization has no fields selected" on every widget even though the same queries returned real data when run directly via the API under the same identity. `True` runs queries as the publisher instead, which is the right tradeoff on a single-admin workspace; revisit if this is ever shared with a viewer who shouldn't see unmasked/unfiltered rows (§6).
+
+### 4.10 Orchestration — `databricks.yml`
+
+One job, `fraud_detection_job_dev`, six sequential tasks:
 
 ```mermaid
 flowchart LR
     A["generate_sample_data"] --> B["run_pipeline (pipeline_task)"]
     B --> C["train_model"]
     C --> D["batch_inference"]
-    D --> E["apply_governance"]
+    D --> E["data_quality_checks"]
+    E --> F["apply_governance"]
 ```
 
-`run_pipeline` is a native `pipeline_task` referencing the Lakeflow pipeline resource by id — the bundle deploys both as one unit.
+`run_pipeline` is a native `pipeline_task` referencing the Lakeflow pipeline resource by id — the bundle deploys both as one unit. `data_quality_checks` sits between inference and governance so it validates both the pipeline's tables and the model's predictions before governance runs — and, when the quality gate trips, before governance runs at all.
 
-### 4.10 CI/CD — `.github/workflows/ci.yml`
+### 4.11 CI/CD — `.github/workflows/ci.yml` / `azure-pipelines.yml`
 
-Two jobs on every push/PR to `main`: **test** runs the pytest suite; **validate-bundle** runs `databricks bundle validate` against `DATABRICKS_HOST`/`DATABRICKS_TOKEN` repo secrets, gated to same-repo pushes/PRs.
+Two jobs on every push/PR to `main`: **test** runs the pytest suite; **validate-bundle** runs `databricks bundle validate` against `DATABRICKS_HOST`/`DATABRICKS_TOKEN` credentials, gated to same-repo pushes/PRs.
+
+`azure-pipelines.yml` mirrors the same two-stage shape for the [Azure DevOps project](https://dev.azure.com/vivekjpr/VivekTiwari_Project1) — `DATABRICKS_HOST`/`DATABRICKS_TOKEN` are set as pipeline variables in the Azure DevOps UI (the token marked secret) rather than in YAML, since Azure Pipelines doesn't support declaring secret values there. The fork-PR secret restriction GitHub Actions expresses as an explicit `if:` condition is instead an org/project-level setting in Azure DevOps ("Make secrets available to builds of forks"), off by default.
 
 ## 5. Design decisions
 
@@ -175,6 +203,7 @@ Two jobs on every push/PR to `main`: **test** runs the pytest suite; **validate-
 - **Direct model loading over `mlflow.pyfunc.spark_udf`** for inference — chosen after hitting the sandbox-parsing bug in §4.6, not as a default preference.
 - **Governance as a separate, idempotent post-step** rather than baked into table definitions — masks and row filters are UC metadata operations, cleanly separable from transformation logic, and safe to rerun after a Lakeflow full refresh resets them.
 - **One job, one bundle** — the entire pipeline reproduces with a single `databricks bundle run`, at the cost of a fully sequential (not maximally parallel) task graph.
+- **Hard gate for integrity/domain checks, WARN-only for drift** (§4.7) — a null key or an out-of-range probability means something upstream is broken and should stop the job; a flagged-rate that drifted from baseline is an investigation prompt, not proof of a broken pipeline, so it's structurally incapable of failing the job (`drift_check` never returns FAIL).
 
 ## 6. Known limitations
 
@@ -188,16 +217,18 @@ Two jobs on every push/PR to `main`: **test** runs the pytest suite; **validate-
 
 ### 7.1 What exists today
 
-13 pytest unit tests over `src/features.py` — the pure-Python mirror of the Spark feature logic — covering edge cases: zero-stddev accounts, empty velocity history, window boundaries, and risk-score saturation. Runs on every push via CI. `databricks bundle validate` also runs in CI, but only checks the bundle definition parses and resolves.
+25 pytest unit tests: 13 over `src/features.py` (the pure-Python mirror of the Spark feature logic — zero-stddev accounts, empty velocity history, window boundaries, risk-score saturation) and 12 over `src/data_quality.py` (pass/fail/warn boundary conditions for each check type, including that `drift_check` can never return FAIL). Runs on every push via CI. `databricks bundle validate` also runs in CI, but only checks the bundle definition parses and resolves.
+
+Since §4.7, a real data-quality gate also runs as part of every job: `data_quality_checks` executes the §8 checks against live tables and fails the job on any hard-gate violation — not a substitute for the unit tests above (it checks data, not code), but it closes the "no data-quality assertion runs after a deployment" gap that used to be listed here.
 
 ### 7.2 Coverage gaps
 
-No integration test actually runs the pipeline. No data-quality assertion runs after a deployment. No quality gate exists before promoting a model alias. The Spark transformation code itself (`transforms/*.py`) is untested — only its pure-Python analogue is.
+No integration test actually runs the pipeline. No quality gate exists before promoting a model alias — `data_quality_checks` validates the data and predictions `train_model` already produced, not whether that training run was itself an improvement (see the model-promotion next step below). The Spark transformation code itself (`transforms/*.py`) is untested — only its pure-Python analogue is.
 
 ### 7.3 Next steps
 
 1. **Spark-level unit tests.** Add a local-PySpark test suite for `transforms/*.py` — fixture DataFrames exercising the silver expectations and gold window calculations directly.
-2. **Scheduled smoke test.** A manually-triggered CI job: deploy to a dedicated test schema, run the job, assert all 10 tables are non-empty, the `champion` alias resolves, and `gold_fraud_predictions` has rows. Truncate afterward.
+2. **Scheduled smoke test.** A manually-triggered CI job: deploy to a dedicated test schema, run the job, assert all 10 tables are non-empty, the `champion` alias resolves, and `gold_fraud_predictions` has rows — largely covered now by `gold_dq_results` (§4.7), but a dedicated test-schema run with truncation afterward is still open.
 3. **Time-based train/test split.** Hold out the last ~20% of days by `transaction_ts` instead of a random stratified split.
 4. **Model quality gate.** Before calling `set_registered_model_alias`, compare the new run's metrics against the current champion's; only promote on improvement.
 5. **Threshold tuning.** Sweep `fraud_threshold` from 0.1–0.9 against the labeled validation set, plot precision/recall, choose deliberately.
@@ -206,7 +237,14 @@ No integration test actually runs the pipeline. No data-quality assertion runs a
 
 ## 8. Data validation
 
-Concrete checks, runnable against `workspace.fraud_detection` via a SQL warehouse or the `databricks` CLI.
+Concrete checks, runnable against `workspace.fraud_detection` via a SQL warehouse or the `databricks` CLI. §8.1–§8.4 and §8.6 now also run automatically every job as `data_quality_checks` (§4.7) — the queries below are the same ones, kept here as the reference for what each check means and for ad-hoc debugging when a run fails. Results of the automated runs live in `gold_dq_results`:
+
+```sql
+SELECT check_name, category, status, actual_value, message
+FROM gold_dq_results
+WHERE run_id = (SELECT run_id FROM gold_dq_results ORDER BY checked_at DESC LIMIT 1)
+ORDER BY status DESC, category;
+```
 
 ### 8.1 Row-count reconciliation
 
@@ -264,8 +302,10 @@ databricks pipelines list-pipeline-events <pipeline-id> --profile <name>
 ### 8.6 Freshness
 
 ```sql
-SELECT MAX(_ingest_ts) FROM bronze_transactions; -- should track the last job run time
+SELECT MAX(scored_at) FROM gold_fraud_predictions; -- should track the last job run time
 ```
+
+Not `MAX(_ingest_ts) FROM bronze_transactions` — the sample data generator writes the same filenames every run, so Auto Loader never reprocesses them and `_ingest_ts` freezes at first ingestion (see the build note in §4.7). `scored_at` is rewritten by `batch_inference` on every run regardless.
 
 ### 8.7 Label & prediction sanity
 
@@ -303,7 +343,7 @@ databricks tables get workspace.fraud_detection.<table> --profile <name>
 End to end, after any change to the pipeline or model:
 
 1. Deploy: `databricks bundle deploy --profile <name>`
-2. Run: `databricks bundle run fraud_detection_job --profile <name>` and confirm all five tasks succeed.
+2. Run: `databricks bundle run fraud_detection_job --profile <name>` and confirm all six tasks succeed — a `data_quality_checks` failure means a hard-gate check failed; the run output prints every check's status, and the same detail is queryable in `gold_dq_results` (§8) and visible on the dashboard's Data Quality page (§4.9).
 3. Row counts: run §8.1 — confirm the bronze → silver → gold shape looks right for this run's data volume.
 4. Integrity: run §8.2 and §8.3 — zero nulls, zero duplicates, zero orphaned foreign keys.
 5. Domain checks: run §8.4 — zero rows outside valid ranges.

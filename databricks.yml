@@ -32,8 +32,9 @@ resources:
       name: fraud_detection_job_${bundle.target}
       description: >-
         Generates sample data, runs the Lakeflow bronze/silver/gold pipeline,
-        trains + registers the fraud model, scores new transactions, and applies
-        Unity Catalog governance (masks/row filters/tags).
+        trains + registers the fraud model, scores new transactions, runs automated
+        data quality checks, and applies Unity Catalog governance (masks/row
+        filters/tags).
       parameters:
         - name: catalog
           default: ${var.catalog}
@@ -72,9 +73,21 @@ resources:
               schema: "{{job.parameters.schema}}"
               fraud_threshold: "0.5"
 
-        - task_key: apply_governance
+        - task_key: data_quality_checks
           depends_on:
             - task_key: batch_inference
+          notebook_task:
+            notebook_path: governance/04_data_quality_checks.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+              max_freshness_minutes: "1440"
+              max_drift_deviation: "0.75"
+              enforce_quality_gate: "true"
+
+        - task_key: apply_governance
+          depends_on:
+            - task_key: data_quality_checks
           notebook_task:
             notebook_path: governance/03_apply_governance.py
             base_parameters:
