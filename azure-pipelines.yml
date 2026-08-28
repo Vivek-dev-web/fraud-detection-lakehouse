@@ -14,6 +14,12 @@
 # one-time manual setup: Pipelines -> Environments -> New environment -> name it
 # "databricks-dev" -> skip the resource picker -> then on that environment's page,
 # "..." -> Approvals and checks -> Approvals -> add yourself as approver.
+#
+# DeployProd is the same shape targeting the real "prod" bundle target (databricks.yml --
+# separate schema, workspace.fraud_detection_prod, same Free Edition workspace since there's
+# no second Databricks workspace here) and needs its own "databricks-prod" Environment set up
+# the same manual way, with its own approval gate -- so approving dev never implicitly
+# approves prod.
 
 trigger:
   branches:
@@ -88,6 +94,39 @@ stages:
                     DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
                 - script: databricks bundle run fraud_detection_job
                   displayName: Run fraud_detection_job (waits for completion)
+                  env:
+                    DATABRICKS_HOST: $(DATABRICKS_HOST)
+                    DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+
+  - stage: DeployProd
+    displayName: Deploy to Databricks (prod)
+    dependsOn: Deploy
+    condition: >
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+    jobs:
+      - deployment: deploy_and_run_prod
+        displayName: bundle deploy + bundle run (prod target)
+        environment: databricks-prod
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+                  displayName: Install Databricks CLI
+                - script: databricks bundle deploy -t prod
+                  displayName: Deploy bundle (prod)
+                  env:
+                    DATABRICKS_HOST: $(DATABRICKS_HOST)
+                    DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+                - script: databricks bundle run fraud_detection_job -t prod
+                  displayName: Run fraud_detection_job (prod, waits for completion)
                   env:
                     DATABRICKS_HOST: $(DATABRICKS_HOST)
                     DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)

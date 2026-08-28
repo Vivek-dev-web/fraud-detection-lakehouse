@@ -126,11 +126,24 @@ lives on GitHub, not in Azure Repos:
    name it `databricks-dev`, skip the resource picker. Then on that environment's page,
    **... -> Approvals and checks -> Approvals**, and add yourself as approver. Without this
    step the Deploy stage will fail waiting on an environment that doesn't exist yet.
+5. Repeat step 4 for the `DeployProd` stage, but name the environment `databricks-prod` --
+   it needs its own independent approval gate so approving a dev deploy never implicitly
+   approves prod.
 
-Free tier covers this comfortably: Boards and the first 5 users are free on the Basic plan,
-and Azure Pipelines gives 1,800 free minutes/month on Microsoft-hosted agents -- a full
-`bundle deploy` + `bundle run` takes roughly 10-15 minutes, so dozens of manually-approved
-deploys per month stay well inside the free tier.
+The `prod` bundle target writes to `workspace.fraud_detection_prod` in the same Free Edition
+workspace as `dev` (there's no second Databricks workspace here) -- its schema and
+`raw_landing`/`checkpoints` volumes need to exist before the first `DeployProd` run:
+
+```bash
+databricks schemas create fraud_detection_prod workspace --profile <name>
+databricks volumes create workspace fraud_detection_prod raw_landing MANAGED --profile <name>
+databricks volumes create workspace fraud_detection_prod checkpoints MANAGED --profile <name>
+```
+
+Free tier covers all of this comfortably: Boards and the first 5 users are free on the Basic
+plan, and Azure Pipelines gives 1,800 free minutes/month on Microsoft-hosted agents -- a full
+`bundle deploy` + `bundle run` takes roughly 10-15 minutes, so even running both Deploy and
+DeployProd on every merge stays well inside the free tier for realistic usage.
 
 ## Notes / caveats
 
