@@ -147,6 +147,22 @@ plan, and Azure Pipelines gives 1,800 free minutes/month on Microsoft-hosted age
 `bundle deploy` + `bundle run` takes roughly 10-15 minutes, so even running both Deploy and
 DeployProd on every merge stays well inside the free tier for realistic usage.
 
+## Repository mirrors
+
+GitHub is the source of truth for this project -- Azure Repos
+(`vivekjpr/VivekTiwari_Project1/fraud-detection-lakehouse-mirror`) carries a one-way,
+point-in-time mirror, kept purely so Azure Repos' branch/PR/tag features have real history to
+work against.
+
+It's populated via `az repos import create --git-source-url <this-repo>` (server-side import
+through the `azure-devops` CLI extension) rather than a local `git push` -- Git Credential
+Manager's interactive browser OAuth prompt can't complete in a non-interactive shell against
+this org. That import only works once, into an empty repository -- there's no supported
+incremental re-sync, verified live (`az repos import create` on an already-imported repo:
+`Can only import into an empty repository`). Bringing it up to date later means creating a
+new repo and reimporting, not rerunning the same command. Branches/PRs created directly in
+Azure Repos don't flow back to GitHub either way.
+
 ## Notes / caveats
 
 - **The workspace owner is not exempt from masks/row filters -- verified, this was wrong
